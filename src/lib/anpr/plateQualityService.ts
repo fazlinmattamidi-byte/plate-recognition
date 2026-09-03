@@ -31,6 +31,7 @@ import {
   createPlateQualityDatasetSchema,
   parsePlateQualityMetadata,
   probabilitiesFromOutput,
+  type PlateQualityDecision,
   scorePlateQuality,
 } from './plateQualityScoring';
 import { assessCropQuality, CropQualityReport } from './qualityAssessor';
@@ -245,6 +246,13 @@ export class PlateQualityService {
       minQualityScore,
       minimumClassifierConfidence,
     });
+    const fallbackDecision = applyLegacyHeuristicFallback(
+      decision,
+      report,
+      measurements.cropWidth,
+      measurements.cropHeight,
+      minReadableWidth
+    );
 
     return this.buildResult({
       primaryClass: heuristic.primaryClass,
@@ -252,7 +260,7 @@ export class PlateQualityService {
       probabilities: heuristic.probabilities,
       measurements,
       report,
-      decision,
+      decision: fallbackDecision,
       backend: 'heuristic',
       latencyMs: this.deps.nowFn() - startedAt,
     });
@@ -574,6 +582,30 @@ export function classifyPlateQuality(
   options: PlateQualityModelOptions = {}
 ): Promise<PlateQualityResult> {
   return globalPlateQualityService.classify(cropCanvas, options);
+}
+
+function applyLegacyHeuristicFallback(
+  decision: PlateQualityDecision,
+  report: CropQualityReport,
+  cropWidth: number,
+  cropHeight: number,
+  minReadableWidth: number
+): PlateQualityDecision {
+  if (decision.acceptableForOCR || report.recommendation === 'REJECT') return decision;
+
+  const hasReadableDimensions = cropWidth >= minReadableWidth && cropHeight >= 18;
+  const legacyScannerWouldTryOcr = hasReadableDimensions && report.overallScore >= 0.25 && report.blurScore >= 15;
+  if (!legacyScannerWouldTryOcr) return decision;
+
+  return {
+    ...decision,
+    acceptableForOCR: true,
+    rejectionReasons: [],
+    selectedPreprocessing: [
+      'ORIGINAL',
+      ...decision.selectedPreprocessing.filter((variant) => variant !== 'ORIGINAL'),
+    ],
+  };
 }
 
 export {

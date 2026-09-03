@@ -184,6 +184,36 @@ describe('PlateQualityService', () => {
     expect(service.getEngineLabel()).toBe('QUALITY ENGINE: HEURISTIC');
   });
 
+  it('keeps legacy OCR admission for marginal heuristic crops when the quality model is missing', async () => {
+    (globalThis as TestGlobal).window = {};
+    const service = new PlateQualityService({
+      fetchFn: vi.fn(async () => ({ ok: false, status: 404 } as Response)),
+    });
+    const result = await service.classify(createFakeCanvas(180, 52, (x, y) => ((x + y) % 2 ? 80 : 170)), {
+      heuristicReport: {
+        overallScore: 0.34,
+        isBlurry: true,
+        blurScore: 22,
+        brightnessScore: 0.58,
+        contrastScore: 0.35,
+        glareScore: 0.1,
+        motionBlurScore: 0.7,
+        sharpnessScore: 0.22,
+        aspectRatioScore: 1,
+        recommendation: 'MARGINAL',
+        reason: 'Moderate blur or contrast',
+      },
+      minReadableWidth: 40,
+      minQualityScore: 0.45,
+    });
+
+    expect(result.backend).toBe('heuristic');
+    expect(result.source).toBe('HEURISTIC');
+    expect(result.acceptableForOCR).toBe(true);
+    expect(result.selectedPreprocessing[0]).toBe('ORIGINAL');
+    expect(result.rejectionReasons).toEqual([]);
+  });
+
   it('falls back from WebGPU to WASM and disposes warmup tensors', async () => {
     (globalThis as TestGlobal).window = {};
     let tensorDisposed = 0;
