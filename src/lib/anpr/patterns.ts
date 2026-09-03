@@ -86,9 +86,9 @@ export const MALAYSIAN_PATTERNS: PlatePatternDefinition[] = [
     id: 'LETTER_NUMBER_SUFFIX',
     category: 'LETTER_NUMBER_SUFFIX',
     description: 'KL/Peninsular Letter-Number-Letter Series (e.g. W1234A, V123A)',
-    regex: /^[A-Z]{1,3}[0-9]{1,5}[A-Z]{1,2}$/,
+    regex: /^[A-Z]{1,3}[0-9]{1,5}[A-Z]$/,
     minLen: 3,
-    maxLen: 10,
+    maxLen: 9,
     hasTrailingSuffix: true,
     priority: 85,
     isStrict: true,
@@ -295,9 +295,10 @@ export function validateMalaysianPattern(normalizedPlate: string): PatternValida
 
     if (pattern.regex.test(normalizedPlate)) {
       // Calculate score based on priority and strictness
+      const isRecognizedPattern = pattern.id !== 'GENERIC_MALAYSIAN';
       const baseScore = Math.min(1.0, pattern.priority / 100);
       return {
-        isValid: true,
+        isValid: isRecognizedPattern,
         pattern,
         category: pattern.category,
         score: baseScore,

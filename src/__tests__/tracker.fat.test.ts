@@ -281,4 +281,40 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
     carANewTrack?.votes.set('AAA1111', { count: 1, totalConfidence: 0.9 });
     expect(Array.from(carANewTrack?.votes.keys() ?? [])).toEqual(['AAA1111']);
   });
+
+  it('FAT Scenario 15: Camera moves away: track with recognized plate never jumps to a distant zero-IoU box', () => {
+    // Frame 1: Plate is detected and has plate votes
+    const initialTracks = tracker.updateTracks([{ x: 100, y: 100, width: 80, height: 25, confidence: 0.88 }]);
+    const plateTrack = initialTracks[0];
+    plateTrack.votes.set('WCU6852', { count: 3, totalConfidence: 2.7 });
+
+    // Frame 2: Phone moves away to an unrelated button/box 200px away (0 IoU)
+    const movedTracks = tracker.updateTracks([{ x: 300, y: 350, width: 75, height: 24, confidence: 0.82 }]);
+    const newBoxTrack = movedTracks.find((t) => t.visibleThisFrame);
+
+    // The plateTrack must NOT be hijacked by the distant box
+    expect(newBoxTrack).toBeDefined();
+    expect(newBoxTrack?.trackId).not.toBe(plateTrack.trackId);
+    expect(newBoxTrack?.votes.size).toBe(0);
+    expect(plateTrack.visibleThisFrame).toBe(false);
+  });
+
+  it('FAT Scenario 16: Non-plate false positive is rapidly pruned when lost', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+
+    // False positive seen for 5 frames without plate votes and lower confidence
+    let tracks: any[] = [];
+    for (let i = 0; i < 5; i++) {
+      tracks = tracker.updateTracks([{ x: 150, y: 200, width: 60, height: 20, confidence: 0.52 }]);
+    }
+    const fpTrack = tracks[0];
+    expect(fpTrack).toBeDefined();
+    expect(fpTrack.votes.size).toBe(0);
+
+    // When phone moves away, the false positive is pruned immediately
+    vi.setSystemTime(1200);
+    tracker.updateTracks([]);
+    expect(tracker.getTrack(fpTrack.trackId)).toBeUndefined();
+  });
 });

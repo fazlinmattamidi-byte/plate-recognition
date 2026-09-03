@@ -85,6 +85,20 @@ describe('PlateQ Universal ANPR Pipeline & Pattern Engine Tests', () => {
     expect(validateMalaysianPattern('JQ1234').category).toBe('STANDARD');
   });
 
+  it('rejects common non-plate English word false positives (SH4RE, S4VE, etc.)', () => {
+    expect(validateMalaysianPattern('SH4RE').isValid).toBe(false);
+    expect(validateMalaysianPattern('S4VE').isValid).toBe(false);
+    expect(validateMalaysianPattern('C0DE').isValid).toBe(false);
+    expect(validateMalaysianPattern('D4TE').isValid).toBe(false);
+    expect(validateMalaysianPattern('L1NE').isValid).toBe(false);
+    expect(validateMalaysianPattern('P4GE').isValid).toBe(false);
+
+    // Valid single-letter suffix series must remain valid
+    expect(validateMalaysianPattern('W1234A').isValid).toBe(true);
+    expect(validateMalaysianPattern('V123A').isValid).toBe(true);
+    expect(validateMalaysianPattern('KV1234E').isValid).toBe(true);
+  });
+
   it('generates character confusion candidates for OCR ambiguity', () => {
     const candidates = generateCandidatePlates('WXY77B8');
     expect(candidates).toContain('WXY7788');

@@ -422,8 +422,6 @@ function getCameraProfileValues(
   mobileOptimized = false
 ): { width: number; height: number; fps: number } {
   if (mobileOptimized) {
-    if (adaptationLevel >= 3) return { width: 854, height: 480, fps: 20 };
-    if (adaptationLevel >= 2) return { width: 960, height: 540, fps: 24 };
     return { width: 1280, height: 720, fps: 24 };
   }
 
@@ -772,15 +770,13 @@ function canRecoverRuntimeProfile(
   cameraFps: number
 ): boolean {
   const detectorTargetMs = getTierDetectorTargetMs(snapshot.deviceTier);
-  const recentDetectorAvg = getSampleAverage(snapshot.detectorLatencyHistoryMs, 16);
-  const recentOcrAvg = getSampleAverage(snapshot.ocrLatencyHistoryMs, 8);
+  const recentDetectorAvg = getSampleAverage(snapshot.detectorLatencyHistoryMs, 10);
   const detectorHealthy =
     snapshot.detectorLatencySamples < 8 ||
-    (recentDetectorAvg > 0 && recentDetectorAvg < detectorTargetMs * 1.15 && snapshot.detectorLatencyP95Ms < detectorTargetMs * 1.7);
-  const ocrHealthy = snapshot.ocrLatencySamples < 4 || recentOcrAvg < 450 || snapshot.lastOcrQueueDepth <= 1;
-  const cameraHealthy = cameraFps === 0 || cameraFps >= 10;
+    (recentDetectorAvg > 0 && recentDetectorAvg < detectorTargetMs * 1.5);
+  const cameraHealthy = cameraFps === 0 || cameraFps >= 8;
 
-  return detectorHealthy && ocrHealthy && cameraHealthy && detectorFps >= 2 && snapshot.lastOcrQueueDepth <= 2;
+  return detectorHealthy && cameraHealthy;
 }
 
 function classifyDeviceTier(
@@ -885,10 +881,10 @@ function getActiveCameraCaptureConfig(
 }
 
 function getProcessingMaxLongEdge(tier: DeviceTier, adaptationLevel = 0, adaptiveMaxLongEdge?: number): number {
-  if (adaptiveMaxLongEdge) return adaptiveMaxLongEdge;
-  if (adaptationLevel >= 3) return 360;
-  if (adaptationLevel >= 2) return 420;
-  if (adaptationLevel >= 1) return 560;
+  if (adaptiveMaxLongEdge) return Math.max(720, adaptiveMaxLongEdge);
+  if (adaptationLevel >= 3) return 720;
+  if (adaptationLevel >= 2) return 800;
+  if (adaptationLevel >= 1) return 960;
 
   if (tier === 'A') return 1600;
   if (tier === 'B') return 1280;
@@ -1096,11 +1092,11 @@ const MAX_OVERLAY_TILT_RAD = 0.35;
 const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
 const COOLDOWN_MAP_MAX_ENTRIES = 120;
 const PERFORMANCE_ADAPTATION_CHECK_MS = 5000;
-const PERFORMANCE_ADAPTATION_COOLDOWN_MS = 12000;
-const PERFORMANCE_RECOVERY_COOLDOWN_MS = 45000;
+const PERFORMANCE_ADAPTATION_COOLDOWN_MS = 20000;
+const PERFORMANCE_RECOVERY_COOLDOWN_MS = 8000;
 const CAMERA_CONSTRAINT_APPLY_COOLDOWN_MS = 10000;
 const ENVIRONMENT_SAMPLE_INTERVAL_MS = 1200;
-const DATASET_SAMPLE_LIMIT = 250;
+const DATASET_SAMPLE_LIMIT = 20;
 const MOBILE_SCANNER_PREVENTIVE_REFRESH_MS = 20 * 60 * 1000;
 const MOBILE_SCANNER_RELOAD_MIN_UPTIME_MS = 90 * 1000;
 const MOBILE_SCANNER_RELOAD_COOLDOWN_MS = 2 * 60 * 1000;
@@ -2995,8 +2991,8 @@ export default function ScannerPage() {
         qualityClass: runtimeMetricsRef.current.currentQuality,
         qualityConfidence: runtimeMetricsRef.current.currentQualityConfidence,
       });
-      if (completedTrackEventsRef.current.length > 500) {
-        completedTrackEventsRef.current.length = 500;
+      if (completedTrackEventsRef.current.length > 50) {
+        completedTrackEventsRef.current.length = 50;
       }
 
       track.matchType = resolvedMatchType;
@@ -3154,7 +3150,6 @@ export default function ScannerPage() {
 
     if (slotsToScan.length === 0) return;
 
-    const flushInterval = window.setInterval(flushScannerMetrics, SCANNER_UI_FLUSH_INTERVAL_MS);
     const cleanupRunners = slotsToScan.map((slot) => {
       const slotId = slot.id;
       const runtime = getSlotRuntime(slotId);
@@ -3396,13 +3391,10 @@ export default function ScannerPage() {
           readableConfirmedTracks.some((track) => (track.motionScore ?? 0) >= MOTION_UNSTABLE_MAX);
         let targetInterval = adaptiveDetectorIntervalMs;
         if (activeOcrCount.current > 0) {
-          targetInterval = realtimeTrackingMode
-            ? Math.max(motionAwareTargetMs, Math.round(adaptiveDetectorIntervalMs * 0.9))
-            : Math.max(
-                adaptiveDetectorIntervalMs,
-                Math.max(motionAwareTargetMs, adaptiveConfigRef.current.detector.busyIntervalMs),
-                getTierDetectorBusyIntervalMs(runtimeMetricsRef.current.deviceTier)
-              );
+          targetInterval = Math.min(
+            targetInterval + 20,
+            Math.max(motionAwareTargetMs, 140)
+          );
         }
         const nextDelay = Math.max(
           Math.max(DETECTION_MIN_DELAY_MS, adaptiveConfigRef.current.detector.minDelayMs),
@@ -3978,7 +3970,6 @@ export default function ScannerPage() {
 
     return () => {
       stopped = true;
-      window.clearInterval(flushInterval);
       cleanupRunners.forEach((cleanup) => cleanup());
       flushScannerMetrics();
     };
@@ -4020,6 +4011,11 @@ export default function ScannerPage() {
       const plateText = getTrackPlateText(track);
       const label = plateText || (track.matchType ? getTrackStatusLabel(track) : '');
       const angle = track.overlayAngle ?? 0;
+
+      // Do not draw persistent unconfirmed boxes on non-plates / background noise
+      if (!label && (track.framesSeen >= 3 || (track.bbox.confidence ?? 0) < 0.65)) {
+        return;
+      }
       const cx = x + boxWidth / 2;
       const cy = y + boxHeight / 2;
       const drawWidth = boxWidth * 1.02;

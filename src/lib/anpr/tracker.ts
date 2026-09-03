@@ -161,10 +161,10 @@ export class PlateTracker {
   private trackCounter: number = 1;
   private frameIndex: number = 0;
   private iouThreshold: number = 0.30;
-  private lostTrackTimeout: number = 20; // Frames before a confirmed track is pruned (~2s at 10 FPS)
-  private lostTrackTimeoutMs: number = 2000; // Time-based expiration in milliseconds (invariant to FPS drops)
-  private completedTrackLostTimeoutMs: number = 800;
-  private unconfirmedTrackTimeoutMs: number = 260;
+  private lostTrackTimeout: number = 12; // Frames before a confirmed track is pruned (~600-800ms)
+  private lostTrackTimeoutMs: number = 750; // Time-based expiration in milliseconds (invariant to FPS drops)
+  private completedTrackLostTimeoutMs: number = 350;
+  private unconfirmedTrackTimeoutMs: number = 200;
   private maxPredictionFrames: number = 2;
   private maxActiveTracks: number = 8;
   private minConfirmationFrames: number = 2;
@@ -177,23 +177,23 @@ export class PlateTracker {
     const aspectRatio = candidateAspect / Math.max(0.1, referenceAspect);
 
     return (
-      widthRatio >= 0.45 &&
-      widthRatio <= 2.20 &&
-      heightRatio >= 0.45 &&
-      heightRatio <= 2.20 &&
-      aspectRatio >= 0.45 &&
-      aspectRatio <= 2.20
+      widthRatio >= 0.55 &&
+      widthRatio <= 1.85 &&
+      heightRatio >= 0.55 &&
+      heightRatio <= 1.85 &&
+      aspectRatio >= 0.55 &&
+      aspectRatio <= 1.85
     );
   }
 
   private getAssociationDistanceLimit(track: ActiveTrack, targetBox: BoundingBox, confidence: number): number {
     const baseSize = Math.max(targetBox.width, targetBox.height, 1);
     const framesMissing = Math.max(0, this.frameIndex - track.lastSeenFrame - 1);
-    const velocityBoost = Math.min(baseSize * 0.55, Math.hypot(track.vx, track.vy) * Math.max(1, framesMissing + 1));
-    const missedFrameBoost = Math.min(baseSize * 0.22, framesMissing * baseSize * 0.10);
-    const confidenceBoost = confidence >= 0.70 ? baseSize * 0.15 : 0;
+    const velocityBoost = Math.min(baseSize * 0.40, Math.hypot(track.vx, track.vy) * Math.max(1, framesMissing + 1));
+    const missedFrameBoost = Math.min(baseSize * 0.15, framesMissing * baseSize * 0.08);
+    const confidenceBoost = confidence >= 0.70 ? baseSize * 0.10 : 0;
 
-    return baseSize * 1.20 + velocityBoost + missedFrameBoost + confidenceBoost;
+    return baseSize * 0.85 + velocityBoost + missedFrameBoost + confidenceBoost;
   }
 
   private shouldPredictTrack(track: ActiveTrack): boolean {
@@ -396,6 +396,7 @@ export class PlateTracker {
     this.activeTracks.forEach((track) => {
       if (this.shouldSkipAssociationAfterGap(track)) return;
 
+      const hasPlateEvidence = (track.votes && track.votes.size > 0) || Boolean(track.stabilizedPlate);
       let bestMatchScore = 0;
       let bestIdx = -1;
       let bestIoU = 0;
@@ -403,24 +404,32 @@ export class PlateTracker {
       highConfDets.forEach(({ box, idx }) => {
         if (!unassignedHigh.has(idx)) return;
         const targetBox = track.predictedBbox || track.bbox;
-        if (!this.shouldPredictTrack(track) && calculateIoU(targetBox, box) <= this.iouThreshold) return;
+        const iouPredicted = track.predictedBbox ? calculateIoU(track.predictedBbox, box) : 0;
+        const iouCurrent = calculateIoU(track.bbox, box);
+        const maxIoU = Math.max(iouPredicted, iouCurrent);
+
+        // Crucial: A track with plate evidence MUST have physical spatial overlap.
+        // It must NEVER be hijacked by an unrelated detection across empty space!
+        if (hasPlateEvidence && maxIoU < 0.08) return;
+        if (!this.shouldPredictTrack(track) && maxIoU <= this.iouThreshold) return;
         if (!this.isScaleCompatible(targetBox, box)) return;
 
-        const iou = calculateIoU(targetBox, box);
         const dist = calculateCentroidDistance(targetBox, box);
         const maxDist = this.getAssociationDistanceLimit(track, targetBox, box.confidence);
 
         let score = 0;
-        if (iou > this.iouThreshold) {
-          score = 1.0 + iou; // prioritize IoU
-        } else if (dist < maxDist) {
-          score = 1.0 - (dist / maxDist); // fallback to distance
+        if (maxIoU > this.iouThreshold) {
+          score = 1.0 + maxIoU; // prioritize IoU
+        } else if (maxIoU >= 0.08) {
+          score = 0.6 + maxIoU; // partial overlap with prediction/current
+        } else if (!hasPlateEvidence && dist < maxDist * 0.75) {
+          score = (1.0 - (dist / maxDist)) * 0.5; // fallback to distance only for unverified tracks
         }
 
         if (score > bestMatchScore) {
           bestMatchScore = score;
           bestIdx = idx;
-          bestIoU = iou;
+          bestIoU = maxIoU;
         }
       });
 
@@ -436,6 +445,7 @@ export class PlateTracker {
       if (track.lastSeenFrame === this.frameIndex) return; // Already updated in Stage 1
       if (this.shouldSkipAssociationAfterGap(track)) return;
 
+      const hasPlateEvidence = (track.votes && track.votes.size > 0) || Boolean(track.stabilizedPlate);
       let bestMatchScore = 0;
       let bestIdx = -1;
       let bestIoU = 0;
@@ -443,24 +453,30 @@ export class PlateTracker {
       lowConfDets.forEach(({ box, idx }) => {
         if (!unassignedLow.has(idx)) return;
         const targetBox = track.predictedBbox || track.bbox;
-        if (!this.shouldPredictTrack(track) && calculateIoU(targetBox, box) <= this.iouThreshold) return;
+        const iouPredicted = track.predictedBbox ? calculateIoU(track.predictedBbox, box) : 0;
+        const iouCurrent = calculateIoU(track.bbox, box);
+        const maxIoU = Math.max(iouPredicted, iouCurrent);
+
+        if (hasPlateEvidence && maxIoU < 0.10) return;
+        if (!this.shouldPredictTrack(track) && maxIoU <= this.iouThreshold) return;
         if (!this.isScaleCompatible(targetBox, box)) return;
 
-        const iou = calculateIoU(targetBox, box);
         const dist = calculateCentroidDistance(targetBox, box);
-        const maxDist = this.getAssociationDistanceLimit(track, targetBox, box.confidence) * 0.85;
+        const maxDist = this.getAssociationDistanceLimit(track, targetBox, box.confidence) * 0.80;
 
         let score = 0;
-        if (iou > this.iouThreshold * 0.8) {
-          score = 1.0 + iou;
-        } else if (dist < maxDist) {
-          score = 1.0 - (dist / maxDist);
+        if (maxIoU > this.iouThreshold * 0.8) {
+          score = 1.0 + maxIoU;
+        } else if (maxIoU >= 0.08) {
+          score = 0.5 + maxIoU;
+        } else if (!hasPlateEvidence && dist < maxDist * 0.65) {
+          score = (1.0 - (dist / maxDist)) * 0.4;
         }
 
         if (score > bestMatchScore) {
           bestMatchScore = score;
           bestIdx = idx;
-          bestIoU = iou;
+          bestIoU = maxIoU;
         }
       });
 
@@ -515,21 +531,30 @@ export class PlateTracker {
         ocrJobQueued: false,
         votes: new Map(),
         cooldownActive: false,
-        isConfirmed: box.confidence >= 0.55, // Instantly confirm confident YOLO plates for fast-moving scenes
+        isConfirmed: box.confidence >= 0.72, // Only highly confident YOLO detections confirm on frame 1
       };
       this.activeTracks.set(newTrack.trackId, newTrack);
     });
 
-    // 6. Remove Stale Tracks by Timestamp (2000 ms timeout for confirmed tracks)
+    // 6. Remove Stale Tracks by Timestamp & Prune Non-Plate False Positives
     const now = Date.now();
     this.activeTracks.forEach((track, id) => {
       const timeLostMs = now - (track.lastSeenTimestamp || 0);
-      const timeoutMs = track.isConfirmed
+      const isPersistentFalsePositive =
+        track.framesSeen >= 5 &&
+        (!track.votes || track.votes.size === 0) &&
+        !track.stabilizedPlate &&
+        (track.bbox.confidence < 0.65 || (track.stats?.ocrAttempts ?? 0) >= 2);
+
+      const effectiveTimeoutMs = isPersistentFalsePositive
+        ? 150
+        : track.isConfirmed
         ? track.cooldownActive
           ? this.completedTrackLostTimeoutMs
           : this.lostTrackTimeoutMs
         : this.unconfirmedTrackTimeoutMs;
-      if (timeLostMs > timeoutMs) {
+
+      if (timeLostMs > effectiveTimeoutMs || (isPersistentFalsePositive && !track.visibleThisFrame)) {
         track.trackState = 'REMOVED';
         track.pipelineState = track.cooldownActive ? 'FINISHED' : track.pipelineState;
         if (track.stats) {
@@ -565,8 +590,8 @@ export class PlateTracker {
 
   public setLostTrackTimeout(frames: number): void {
     this.lostTrackTimeout = frames;
-    this.lostTrackTimeoutMs = frames * 100;
-    this.completedTrackLostTimeoutMs = Math.min(800, this.lostTrackTimeoutMs);
+    this.lostTrackTimeoutMs = Math.min(1000, Math.max(300, frames * 60));
+    this.completedTrackLostTimeoutMs = Math.min(350, this.lostTrackTimeoutMs);
   }
 
   public configureRuntime(options: TrackerRuntimeTuning): void {
@@ -574,12 +599,12 @@ export class PlateTracker {
       this.maxPredictionFrames = Math.max(0, Math.min(4, Math.round(options.maxPredictionFrames)));
     }
     if (typeof options.lostTrackTimeoutMs === 'number') {
-      this.lostTrackTimeoutMs = Math.max(120, Math.min(2500, Math.round(options.lostTrackTimeoutMs)));
-      this.lostTrackTimeout = Math.max(1, Math.round(this.lostTrackTimeoutMs / 100));
-      this.completedTrackLostTimeoutMs = Math.min(500, this.lostTrackTimeoutMs);
+      this.lostTrackTimeoutMs = Math.max(120, Math.min(1000, Math.round(options.lostTrackTimeoutMs)));
+      this.lostTrackTimeout = Math.max(1, Math.round(this.lostTrackTimeoutMs / 60));
+      this.completedTrackLostTimeoutMs = Math.min(350, this.lostTrackTimeoutMs);
     }
     if (typeof options.unconfirmedTrackTimeoutMs === 'number') {
-      this.unconfirmedTrackTimeoutMs = Math.max(80, Math.min(1000, Math.round(options.unconfirmedTrackTimeoutMs)));
+      this.unconfirmedTrackTimeoutMs = Math.max(80, Math.min(400, Math.round(options.unconfirmedTrackTimeoutMs)));
     }
   }
 
