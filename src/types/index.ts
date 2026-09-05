@@ -61,6 +61,10 @@ export interface DetectionLog {
   cameraId: string;
   cameraName: string;
   snapshotPlaceholder?: string;
+  snapshotDataUrl?: string;
+  actionStatus?: 'PENDING' | 'REVIEWED';
+  actionedAt?: string;
+  actionedBy?: string;
 }
 
 export interface HistoryLog {

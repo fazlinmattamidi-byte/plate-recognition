@@ -169,6 +169,14 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
     localStorage.setItem('track_vehicles', JSON.stringify(data));
   };
 
+  const updateStoredVehicles = (updater: (currentVehicles: Vehicle[]) => Vehicle[]) => {
+    setVehicles((currentVehicles) => {
+      const updated = updater(currentVehicles);
+      localStorage.setItem('track_vehicles', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
   const saveUsers = (data: UserAccount[]) => {
     setUsers(data);
     localStorage.setItem('track_users', JSON.stringify(data));
@@ -182,6 +190,14 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const saveHistory = (data: HistoryLog[]) => {
     setHistory(data);
     localStorage.setItem('track_history', JSON.stringify(data));
+  };
+
+  const updateStoredHistory = (updater: (currentHistory: HistoryLog[]) => HistoryLog[]) => {
+    setHistory((currentHistory) => {
+      const updated = updater(currentHistory);
+      localStorage.setItem('track_history', JSON.stringify(updated));
+      return updated;
+    });
   };
 
   // Vehicle CRUD
@@ -207,12 +223,13 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
   };
 
   const updateVehicle = (v: Vehicle) => {
-    const updated = vehicles.map((item) =>
-      item.id === v.id
-        ? { ...v, plate: cleanPlateNumber(v.plate), updatedDate: new Date().toISOString() }
-        : item
+    updateStoredVehicles((currentVehicles) =>
+      currentVehicles.map((item) =>
+        item.id === v.id
+          ? { ...v, plate: cleanPlateNumber(v.plate), updatedDate: new Date().toISOString() }
+          : item
+      )
     );
-    saveVehicles(updated);
     addHistoryLog({
       type: 'VEHICLE',
       action: `Updated Vehicle: ${v.plate}`,
@@ -377,8 +394,7 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
       id: createLocalId('hist'),
       timestamp: new Date().toISOString(),
     };
-    const updated = [newLog, ...history];
-    saveHistory(updated);
+    updateStoredHistory((currentHistory) => [newLog, ...currentHistory]);
   };
 
   const clearHistory = () => {

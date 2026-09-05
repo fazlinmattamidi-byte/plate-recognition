@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PlateTracker } from '../lib/anpr/tracker';
+import { ActiveTrack, PlateTracker } from '../lib/anpr/tracker';
 import { validateMalaysianPattern } from '../lib/anpr/patterns';
 
 describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
@@ -304,7 +304,7 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
     vi.setSystemTime(1000);
 
     // False positive seen for 5 frames without plate votes and lower confidence
-    let tracks: any[] = [];
+    let tracks: ActiveTrack[] = [];
     for (let i = 0; i < 5; i++) {
       tracks = tracker.updateTracks([{ x: 150, y: 200, width: 60, height: 20, confidence: 0.52 }]);
     }

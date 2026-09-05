@@ -59,9 +59,17 @@ export default function SearchPage() {
   const [customActionNote, setCustomActionNote] = useState('');
   const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const executeSearchRef = useRef<(query: string) => void>(() => undefined);
-  const searchHistory = history.filter((log) => log.type === 'SEARCH').slice(0, 6);
-  const mobileSearchHistory = searchHistory.slice(0, 4);
   const isMalay = language === 'BM';
+  const searchHistoryTitle = isMalay ? 'Sejarah Carian & Amaran' : 'Search & Alert History';
+  const emptySearchHistoryLabel = isMalay ? 'Belum ada carian atau tindakan amaran.' : 'No searches or alert actions yet.';
+  const searchHistory = history
+    .filter(
+      (log) =>
+        log.type === 'SEARCH' ||
+        (log.type === 'DETECTION' && (log.action.includes('Tanda Tindakan') || log.statusMatch === 'EXACT'))
+    )
+    .slice(0, 6);
+  const mobileSearchHistory = searchHistory.slice(0, 4);
   const mobileSearchPlaceholder = isMalay ? 'Masukkan nombor plat' : 'Enter plate number';
   const mobileSearchLabel = isMalay ? 'Cari' : 'Search';
   const getSearchPlate = (log: (typeof searchHistory)[number]) =>
@@ -246,7 +254,7 @@ export default function SearchPage() {
           <div className="flex items-center gap-2">
             <History className="w-4 h-4 text-cyan-400" />
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">
-              Search History
+              {searchHistoryTitle}
             </h2>
           </div>
           <span className="text-[10px] font-mono text-slate-500">
@@ -290,7 +298,7 @@ export default function SearchPage() {
               </button>
             ))
           ) : (
-            <div className="py-5 text-center text-xs text-slate-500">No manual searches yet.</div>
+            <div className="py-5 text-center text-xs text-slate-500">{emptySearchHistoryLabel}</div>
           )}
         </div>
 
@@ -350,7 +358,7 @@ export default function SearchPage() {
               ) : (
                 <tr>
                   <td colSpan={4} className="py-6 text-center text-slate-500">
-                    No manual searches yet.
+                    {emptySearchHistoryLabel}
                   </td>
                 </tr>
               )}

@@ -108,6 +108,11 @@ type AlertMatch = {
   vehicle: Vehicle;
   cameraName: string;
   cameraId: string;
+  detectionId?: string;
+  snapshotDataUrl?: string;
+  confidence?: number;
+  timestamp?: string;
+  actionStatus?: 'PENDING' | 'REVIEWED';
 };
 
 type CameraSlot = {
@@ -136,6 +141,10 @@ type SeenPlateItem = {
   detail: string;
   searchHref: string;
   active: boolean;
+  detection: SessionDetection | undefined;
+  actionStatus: 'PENDING' | 'REVIEWED' | undefined;
+  snapshotDataUrl: string | undefined;
+  canMarkAction: boolean;
 };
 
 type AudioWindow = Window &
@@ -1046,6 +1055,28 @@ function canvasToJpegDataUrl(canvas: HTMLCanvasElement, quality = 0.82): string 
   }
 }
 
+function rememberTrackPlateSnapshot(
+  track: ActiveTrack,
+  cropCanvas: HTMLCanvasElement,
+  qualityScore: number,
+  ocrText: string,
+  ocrConfidence: number
+): string {
+  const dataUrl = canvasToJpegDataUrl(cropCanvas, 0.82);
+  if (!dataUrl) return track.cropSamples.find((sample) => sample.dataUrl)?.dataUrl || '';
+
+  track.cropSamples.unshift({
+    dataUrl,
+    qualityScore,
+    timestamp: Date.now(),
+    ocrText,
+    ocrConfidence,
+  });
+  track.cropSamples = track.cropSamples.slice(0, 3);
+
+  return dataUrl;
+}
+
 const SCAN_LOCATIONS: ScanLocation[] = [
   { name: 'Sungai Besi Toll Plaza', gps: '3.0602, 101.7047' },
   { name: 'Jalan Tun Razak, Kuala Lumpur', gps: '3.1618, 101.7165' },
@@ -1161,6 +1192,15 @@ function getDetectionSeenPlateTone(detection: SessionDetection): SeenPlateTone {
   if (detection.matchType === 'EXACT' || detection.matched) return 'EXACT';
   if (detection.matchType === 'POSSIBLE') return 'POSSIBLE';
   return 'NONE';
+}
+
+function isUnreviewedAlertDetection(detection?: SessionDetection | null): boolean {
+  return Boolean(
+    detection &&
+      (detection.matchType === 'EXACT' || detection.matched) &&
+      detection.vehicleId &&
+      detection.actionStatus !== 'REVIEWED'
+  );
 }
 
 function getSeenPlateStatusLabel(tone: SeenPlateTone, language: string): string {
@@ -1679,6 +1719,34 @@ function canRunMultiCameraOnCurrentDevice(): boolean {
   return !phoneLikeUserAgent && !narrowViewport;
 }
 
+function getSelectableCameraDeviceCount(devices: DesktopCameraDevice[]): number {
+  const deviceIds = new Set(devices.map((device) => device.deviceId).filter(Boolean));
+  return deviceIds.size;
+}
+
+function getUnusedCameraDeviceId(devices: DesktopCameraDevice[], slots: CameraSlot[]): string {
+  const usedDeviceIds = new Set(slots.map((slot) => slot.deviceId).filter(Boolean));
+  return devices.find((device) => device.deviceId && !usedDeviceIds.has(device.deviceId))?.deviceId || '';
+}
+
+function resolveUniqueCameraSlots(slots: CameraSlot[], devices: DesktopCameraDevice[]): CameraSlot[] {
+  const usedDeviceIds = new Set<string>();
+
+  return slots.map((slot, index) => {
+    let deviceId = slot.deviceId;
+    if (!deviceId || usedDeviceIds.has(deviceId)) {
+      deviceId =
+        devices.find((device) => device.deviceId && !usedDeviceIds.has(device.deviceId))?.deviceId ||
+        devices[index]?.deviceId ||
+        deviceId ||
+        '';
+    }
+
+    if (deviceId) usedDeviceIds.add(deviceId);
+    return { ...slot, deviceId };
+  });
+}
+
 function isMobileScannerDevice(): boolean {
   if (typeof window === 'undefined') return false;
   const userAgent = navigator.userAgent || '';
@@ -1810,6 +1878,7 @@ export default function ScannerPage() {
   const availableCamerasRef = useRef<DesktopCameraDevice[]>([]);
   const cameraMetadataBySlotRef = useRef<Record<string, CameraRuntimeMetadata>>({});
   const supportsMultiCameraScanRef = useRef(false);
+  const reviewedAlertDetectionIdsRef = useRef<Set<string>>(new Set());
   const isCameraReadyRef = useRef(false);
   const isScanningRef = useRef(false);
   const developerModeRef = useRef(false);
@@ -2351,6 +2420,11 @@ export default function ScannerPage() {
         const storedDetections = localStorage.getItem(RECENT_DETECTIONS_STORAGE_KEY);
         if (storedDetections) {
           const parsedDetections = JSON.parse(storedDetections) as SessionDetection[];
+          reviewedAlertDetectionIdsRef.current = new Set(
+            parsedDetections
+              .filter((detection) => detection.actionStatus === 'REVIEWED')
+              .map((detection) => detection.id)
+          );
           setLiveDetections(parsedDetections.slice(0, 8));
           if (parsedDetections[0]) {
             setCurrentPlate(parsedDetections[0].plate);
@@ -2389,14 +2463,17 @@ export default function ScannerPage() {
       const rememberedDeviceId = getRememberedCameraId();
       const preferredCamera = selectPreferredCamera(videoDevices, rememberedDeviceId);
       setCameraSlots((slots) =>
-        slots.map((slot, index) => ({
-          ...slot,
-          deviceId:
-            slot.deviceId ||
-            (index === 0 ? preferredCamera?.deviceId : videoDevices[index]?.deviceId) ||
-            videoDevices[0]?.deviceId ||
-            '',
-        }))
+        resolveUniqueCameraSlots(
+          slots.map((slot, index) => ({
+            ...slot,
+            deviceId:
+              slot.deviceId ||
+              (index === 0 ? preferredCamera?.deviceId : videoDevices[index]?.deviceId) ||
+              videoDevices[0]?.deviceId ||
+              '',
+          })),
+          videoDevices
+        )
       );
       setAvailableCameras(videoDevices);
       setCameraError('');
@@ -2544,13 +2621,15 @@ export default function ScannerPage() {
     const devices = await refreshCameraList();
     if (operationId !== cameraOperationIdRef.current) return false;
 
-    const resolvedSlots =
+    const resolvedSlots = resolveUniqueCameraSlots(
       cameraSlots.length > 0
         ? cameraSlots.map((slot, index) => ({
             ...slot,
             deviceId: slot.deviceId || devices[index]?.deviceId || devices[0]?.deviceId || '',
           }))
-        : [{ id: 'camera-slot-1', deviceId: devices[0]?.deviceId || '' }];
+        : [{ id: 'camera-slot-1', deviceId: devices[0]?.deviceId || '' }],
+      devices
+    );
     const slots = supportsMultiCameraScanRef.current
       ? resolvedSlots
       : [resolvedSlots.find((slot) => slot.id === activeCameraSlotIdRef.current) || resolvedSlots[0]];
@@ -2605,6 +2684,18 @@ export default function ScannerPage() {
   };
 
   const handleCameraSlotDeviceChange = (slotId: string, deviceId: string) => {
+    const duplicateDeviceSelected = Boolean(
+      deviceId && cameraSlotsRef.current.some((slot) => slot.id !== slotId && slot.deviceId === deviceId)
+    );
+    if (duplicateDeviceSelected) {
+      setCameraError(
+        language === 'BM'
+          ? 'Kamera itu sudah digunakan. Pilih kamera lain untuk pengimbas kedua.'
+          : 'That camera is already in use. Choose another camera for the second scanner.'
+      );
+      return;
+    }
+
     const hadActiveCamera =
       isCameraReadyRef.current || isScanningRef.current || previewSlotIds.includes(slotId);
     rememberSelectedCamera(deviceId);
@@ -2707,12 +2798,21 @@ export default function ScannerPage() {
     if (!supportsMultiCameraScanRef.current) return;
 
     const devices = await refreshCameraList();
+    const nextDeviceId = getUnusedCameraDeviceId(devices, cameraSlotsRef.current);
+    if (!nextDeviceId) {
+      setCameraError(
+        language === 'BM'
+          ? 'Sambung atau benarkan kamera kedua sebelum tambah pengimbas.'
+          : 'Connect or allow a second camera before adding another scanner.'
+      );
+      return;
+    }
+
     setCameraSlots((slots) => {
       if (slots.length >= 4) return slots;
-      const nextIndex = slots.length;
-      const nextDeviceId = devices[nextIndex]?.deviceId || devices[0]?.deviceId || slots[0]?.deviceId || '';
       return [...slots, { id: `camera-slot-${Date.now()}`, deviceId: nextDeviceId }];
     });
+    setCameraError('');
   };
 
   const handleRemoveCamera = (slotId: string) => {
@@ -2777,7 +2877,7 @@ export default function ScannerPage() {
       plate: string,
       confidence: number,
       slotId: string,
-      options: { commitNoCase?: boolean } = {}
+      options: { commitNoCase?: boolean; plateSnapshotDataUrl?: string } = {}
     ) => {
       const commitNoCase = options.commitNoCase ?? true;
       const normalizedPlate = cleanPlateNumber(plate);
@@ -2906,6 +3006,8 @@ export default function ScannerPage() {
         gps: scanLocation.gps,
         matchType: resolvedMatchType,
         possibleVehicleIds: possibleVehicles.map((vehicle) => vehicle.id),
+        snapshotDataUrl: options.plateSnapshotDataUrl || track.cropSamples.find((sample) => sample.dataUrl)?.dataUrl,
+        actionStatus: resolvedMatchType === 'EXACT' && matchedVehicle ? 'PENDING' : undefined,
       };
 
       setCurrentPlate(resolvedPlate);
@@ -3007,7 +3109,16 @@ export default function ScannerPage() {
         const alertSlotId = slotId || 'laptop-camera';
         setActiveAlertMatchesBySlot((prev) => ({
           ...prev,
-          [alertSlotId]: { vehicle: matchedVehicle, cameraName: scanCameraName, cameraId: alertSlotId },
+          [alertSlotId]: {
+            vehicle: matchedVehicle,
+            cameraName: scanCameraName,
+            cameraId: alertSlotId,
+            detectionId,
+            snapshotDataUrl: newDetection.snapshotDataUrl,
+            confidence: confidencePercent,
+            timestamp: newDetection.timestamp,
+            actionStatus: 'PENDING',
+          },
         }));
         playAlertChime();
       }
@@ -3385,10 +3496,6 @@ export default function ScannerPage() {
         adaptiveDetectorIntervalMs = Math.round(
           adaptiveDetectorIntervalMs * 0.75 + latencyDrivenInterval * 0.25
         );
-        const realtimeTrackingMode =
-          adaptiveConfigRef.current.environment.label === 'HIGHWAY' ||
-          adaptiveConfigRef.current.environment.label === 'TRAFFIC' ||
-          readableConfirmedTracks.some((track) => (track.motionScore ?? 0) >= MOTION_UNSTABLE_MAX);
         let targetInterval = adaptiveDetectorIntervalMs;
         if (activeOcrCount.current > 0) {
           targetInterval = Math.min(
@@ -3804,6 +3911,13 @@ export default function ScannerPage() {
 
               if (text && conf >= 0.25) {
                 addOcrVoteToTrack(updatedTrack, text, conf, modelQuality.score);
+                const plateSnapshotDataUrl = rememberTrackPlateSnapshot(
+                  updatedTrack,
+                  targetCrop,
+                  modelQuality.qualityScore,
+                  text,
+                  conf
+                );
                 if (updatedTrack.stats) updatedTrack.stats.ocrAccepted++;
                 runtimeMetricsRef.current.ocrAcceptedCount++;
                 updatedTrack.ocrState = 'CONSENSUS_BUILDING';
@@ -3863,6 +3977,7 @@ export default function ScannerPage() {
                   );
                   await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, sourceSlotId, {
                     commitNoCase: noMatchOutcomeReady,
+                    plateSnapshotDataUrl,
                   });
                 } else if (canCommitQuickDatabaseOutcome(text, conf, bestScore, acceptedVoteCount)) {
                   const quickMatchConfidence = Math.max(conf, Math.min(0.98, bestScore));
@@ -3870,6 +3985,7 @@ export default function ScannerPage() {
                   updatedTrack.stabilizedConfidence = quickMatchConfidence;
                   await runDatabaseMatch(updatedTrack, text, quickMatchConfidence, sourceSlotId, {
                     commitNoCase: canCommitNoMatchOutcome(text, quickMatchConfidence, bestScore, acceptedVoteCount),
+                    plateSnapshotDataUrl,
                   });
                 }
               } else if (updatedTrack.votes.size === 0) {
@@ -4094,28 +4210,109 @@ export default function ScannerPage() {
     });
   }
 
+  const markAlertActionReviewed = (args: {
+    vehicle: Vehicle;
+    detectionId?: string;
+    cameraId: string;
+    cameraName: string;
+    source: 'ALERT' | 'LIST';
+  }) => {
+    if (args.detectionId) {
+      if (reviewedAlertDetectionIdsRef.current.has(args.detectionId)) return;
+      reviewedAlertDetectionIdsRef.current.add(args.detectionId);
+    }
+
+    const actionedAt = new Date().toISOString();
+    const flaggedVehicle = { ...args.vehicle, status: 'FLAGGED' as const };
+    updateVehicle(flaggedVehicle);
+    addHistoryLog({
+      type: 'DETECTION',
+      action:
+        args.source === 'ALERT'
+          ? `Tanda Tindakan (Disemak): ${args.vehicle.plate}`
+          : `Tanda Tindakan (Pengimbas): ${args.vehicle.plate}`,
+      plate: args.vehicle.plate,
+      details:
+        args.source === 'ALERT'
+          ? `Alert Tanda Tindakan disemak oleh ${role} pada ${args.cameraName}`
+          : `Scanner action confirmed by ${role} from ${args.cameraName}`,
+      note:
+        args.source === 'ALERT'
+          ? `Ditanda Tindakan oleh ${role} pada ${args.cameraName}`
+          : `Ditanda Tindakan oleh ${role} dari ${args.cameraName}`,
+      cameraId: args.cameraId,
+      cameraName: args.cameraName,
+      userRole: role,
+      statusMatch: 'EXACT',
+    });
+
+    setLiveDetections((prevStream) => {
+      let changed = false;
+      const nextStream = prevStream.map((item) => {
+        const isTarget =
+          (args.detectionId && item.id === args.detectionId) ||
+          (!args.detectionId && item.vehicleId === args.vehicle.id && item.actionStatus !== 'REVIEWED');
+
+        if (!isTarget) return item;
+        changed = true;
+        return {
+          ...item,
+          matched: true,
+          matchType: 'EXACT' as const,
+          vehicleId: args.vehicle.id,
+          actionStatus: 'REVIEWED' as const,
+          actionedAt,
+          actionedBy: role,
+        };
+      });
+
+      if (changed) {
+        localStorage.setItem(RECENT_DETECTIONS_STORAGE_KEY, JSON.stringify(nextStream));
+        return nextStream;
+      }
+
+      return prevStream;
+    });
+
+    setActiveAlertMatchesBySlot((alerts) => {
+      const nextAlerts = { ...alerts };
+      Object.entries(alerts).forEach(([alertSlotId, alertMatch]) => {
+        if (
+          alertMatch.vehicle.id === args.vehicle.id ||
+          (args.detectionId && alertMatch.detectionId === args.detectionId)
+        ) {
+          delete nextAlerts[alertSlotId];
+        }
+      });
+      return nextAlerts;
+    });
+  };
+
   const handleMarkAsSeen = (slotId: string) => {
     const activeAlertMatch = activeAlertMatchesBySlot[slotId];
-    if (activeAlertMatch) {
-      const flaggedObj = { ...activeAlertMatch.vehicle, status: 'FLAGGED' as const };
-      updateVehicle(flaggedObj);
-      addHistoryLog({
-        type: 'DETECTION',
-        action: `Tanda Tindakan (Disemak): ${activeAlertMatch.vehicle.plate}`,
-        plate: activeAlertMatch.vehicle.plate,
-        details: `Alert Tanda Tindakan disemak oleh ${role} pada ${activeAlertMatch.cameraName}`,
-        note: `Ditanda Tindakan oleh ${role} pada ${activeAlertMatch.cameraName}`,
-        cameraId: activeAlertMatch.cameraId,
-        cameraName: activeAlertMatch.cameraName,
-        userRole: role,
-        statusMatch: 'EXACT',
-      });
-    }
-    setActiveAlertMatchesBySlot((alerts) => {
-      if (!alerts[slotId]) return alerts;
-      const nextAlerts = { ...alerts };
-      delete nextAlerts[slotId];
-      return nextAlerts;
+    if (!activeAlertMatch) return;
+
+    markAlertActionReviewed({
+      vehicle: activeAlertMatch.vehicle,
+      detectionId: activeAlertMatch.detectionId,
+      cameraId: activeAlertMatch.cameraId,
+      cameraName: activeAlertMatch.cameraName,
+      source: 'ALERT',
+    });
+  };
+
+  const handleMarkDetectionAction = (detection: SessionDetection) => {
+    if (!isUnreviewedAlertDetection(detection)) return;
+
+    const vehicle = vehicles.find((item) => item.id === detection.vehicleId);
+    if (!vehicle) return;
+
+    markAlertActionReviewed({
+      vehicle,
+      detectionId: detection.id,
+      cameraId: detection.cameraId,
+      cameraName: detection.cameraName,
+      source: 'LIST',
     });
   };
 
@@ -4356,6 +4553,12 @@ export default function ScannerPage() {
       : latestDetection
       ? 'NONE'
       : null;
+  const latestActionPending = isUnreviewedAlertDetection(latestDetection);
+  const selectableCameraDeviceCount = getSelectableCameraDeviceCount(availableCameras);
+  const canAddCameraSlot =
+    supportsMultiCameraScan &&
+    cameraSlots.length < 4 &&
+    selectableCameraDeviceCount > cameraSlots.filter((slot) => Boolean(slot.deviceId)).length;
 
   const showDeveloperOverlay = effectiveDeveloperMode;
   const showUnsupportedBrowserWarning = typeof navigator !== 'undefined' && !isSupportedDesktopScannerBrowser();
@@ -4433,9 +4636,9 @@ export default function ScannerPage() {
     }
   });
   const activeSeenPlateItems: SeenPlateItem[] = tracksList
-    .map((track) => {
+    .flatMap((track): SeenPlateItem[] => {
       const plate = cleanPlateNumber(getTrackPlateText(track));
-      if (!plate) return null;
+      if (!plate) return [];
 
       const recentDetection = recentDetectionByPlate.get(plate);
       const tone = recentDetection ? getDetectionSeenPlateTone(recentDetection) : getTrackSeenPlateTone(track);
@@ -4458,7 +4661,7 @@ export default function ScannerPage() {
                 : 'No match'
               : getTrackStatusLabel(track);
 
-      return {
+      return [{
         id: `track-${track.trackId}`,
         plate,
         tone,
@@ -4468,9 +4671,12 @@ export default function ScannerPage() {
         detail,
         searchHref: `/search?plate=${encodeURIComponent(plate)}`,
         active: true,
-      };
-    })
-    .filter((item): item is SeenPlateItem => Boolean(item));
+        detection: recentDetection,
+        actionStatus: recentDetection?.actionStatus,
+        snapshotDataUrl: recentDetection?.snapshotDataUrl,
+        canMarkAction: isUnreviewedAlertDetection(recentDetection),
+      }];
+    });
   const activeSeenPlateKeys = new Set(activeSeenPlateItems.map((item) => item.plate));
   const recentSeenPlateItems: SeenPlateItem[] = liveDetections
     .filter((detection) => !activeSeenPlateKeys.has(cleanPlateNumber(detection.plate)))
@@ -4498,6 +4704,10 @@ export default function ScannerPage() {
                 : 'No match',
         searchHref: `/search?plate=${encodeURIComponent(detection.plate)}`,
         active: false,
+        detection,
+        actionStatus: detection.actionStatus,
+        snapshotDataUrl: detection.snapshotDataUrl,
+        canMarkAction: isUnreviewedAlertDetection(detection),
       };
     });
   const seenPlateItems = [...activeSeenPlateItems, ...recentSeenPlateItems].slice(0, 8);
@@ -4627,8 +4837,17 @@ export default function ScannerPage() {
               <button
                 type="button"
                 onClick={() => void handleAddCamera()}
-                disabled={cameraSlots.length >= 4}
+                disabled={!canAddCameraSlot}
                 className="hidden sm:inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-bold text-slate-300 transition-all hover:border-cyan-700 hover:text-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed"
+                title={
+                  canAddCameraSlot
+                    ? language === 'BM'
+                      ? 'Tambah pengimbas kamera'
+                      : 'Add camera scanner'
+                    : language === 'BM'
+                      ? 'Tiada kamera tambahan tersedia'
+                      : 'No additional camera available'
+                }
               >
                 <Plus className="w-4 h-4" />
                 <span>{language === 'BM' ? 'Tambah Kamera' : 'Add Camera'}</span>
@@ -4835,12 +5054,22 @@ export default function ScannerPage() {
               </div>
             </div>
 
-            <Link
-              href={latestSearchHref}
-              className="shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[10px] font-black uppercase text-slate-300 hover:border-cyan-800 hover:text-cyan-200"
-            >
-              {language === 'BM' ? 'Semak' : 'View'}
-            </Link>
+            {latestActionPending ? (
+              <button
+                type="button"
+                onClick={() => handleMarkDetectionAction(latestDetection)}
+                className="shrink-0 rounded-lg border border-red-500 bg-white px-2.5 py-1.5 text-[10px] font-black uppercase text-red-600 shadow-sm hover:bg-red-50"
+              >
+                {language === 'BM' ? 'Semak' : 'Review'}
+              </button>
+            ) : (
+              <Link
+                href={latestSearchHref}
+                className="shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[10px] font-black uppercase text-slate-300 hover:border-cyan-800 hover:text-cyan-200"
+              >
+                {language === 'BM' ? 'Semak' : 'View'}
+              </Link>
+            )}
           </div>
         </div>
       )}
@@ -4954,7 +5183,17 @@ export default function ScannerPage() {
                       : [{ deviceId: '', groupId: '', label: slotLabel, kind: 'UNKNOWN_CAMERA' as const }]
                     ).map(
                       (cameraDevice, cameraIndex) => (
-                        <option key={cameraDevice.deviceId || `camera-${cameraIndex}`} value={cameraDevice.deviceId}>
+                        <option
+                          key={cameraDevice.deviceId || `camera-${cameraIndex}`}
+                          value={cameraDevice.deviceId}
+                          disabled={Boolean(
+                            cameraDevice.deviceId &&
+                              cameraSlots.some(
+                                (cameraSlot) =>
+                                  cameraSlot.id !== slot.id && cameraSlot.deviceId === cameraDevice.deviceId
+                              )
+                          )}
+                        >
                           {cameraDevice.label || (cameraIndex === 0 ? slotLabel : `Camera ${cameraIndex + 1}`)}
                         </option>
                       )
@@ -4992,79 +5231,93 @@ export default function ScannerPage() {
                       event.stopPropagation();
                       void handleAddCamera();
                     }}
-                    disabled={cameraSlots.length >= 4}
+                    disabled={!canAddCameraSlot}
                     className="hidden absolute bottom-2.5 right-2.5 z-20 items-center gap-1 rounded-lg border border-slate-700 bg-slate-900/85 px-2.5 py-1 text-[10px] font-bold text-slate-300 disabled:opacity-40"
+                    title={
+                      canAddCameraSlot
+                        ? language === 'BM'
+                          ? 'Tambah pengimbas kamera'
+                          : 'Add camera scanner'
+                        : language === 'BM'
+                          ? 'Tiada kamera tambahan tersedia'
+                          : 'No additional camera available'
+                    }
                   >
                     <Plus className="h-3 w-3" />
                     <span>{language === 'BM' ? 'Tambah' : 'Add'}</span>
                   </button>
                 )}
                 {isAlertSlot && activeSlotAlert && (
-                  <div className="scanner-alert-card absolute inset-1.5 z-30 bg-red-600 border-2 border-red-400 rounded-xl p-2.5 sm:p-4 shadow-2xl flex flex-col justify-between text-center overflow-hidden">
-                    <div className="flex items-center justify-between border-b border-red-500/80 pb-2">
+                  <div className="scanner-alert-card absolute inset-1.5 z-30 flex flex-col gap-2 overflow-hidden rounded-2xl border-2 border-red-300/80 bg-red-600/95 p-3 text-left shadow-2xl sm:p-4">
+                    <div className="flex items-start justify-between gap-3">
                       <div className="flex items-center gap-2 min-w-0">
-                        <ShieldAlert className="w-4 h-4 text-white animate-bounce shrink-0" />
-                        <span className="text-[10px] sm:text-xs font-black uppercase text-white tracking-wider truncate">
-                          {language === 'BM' ? 'AMARAN: PADANAN DIKESAN' : 'ALERT: MATCH DETECTED'}
+                        <ShieldAlert className="h-5 w-5 shrink-0 text-white" />
+                        <span className="text-sm font-black uppercase leading-tight tracking-wider text-white sm:text-lg">
+                          {language === 'BM' ? 'AMARAN: KENDERAAN DEBTOR' : 'ALERT: DEBTOR VEHICLE'}
                         </span>
                       </div>
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
-                          runtimeMetricsRef.current.falseAlertCount++;
                           setActiveAlertMatchesBySlot((alerts) => {
                             const nextAlerts = { ...alerts };
                             delete nextAlerts[slot.id];
                             return nextAlerts;
                           });
                         }}
-                        className="p-1 rounded-lg bg-red-700 hover:bg-red-800 text-white transition-all"
+                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-red-800/70 text-white transition-all hover:bg-red-900"
                         title={t('closeBtn')}
+                        aria-label={t('closeBtn')}
                       >
-                        <X className="w-4 h-4" />
+                        <X className="h-5 w-5" />
                       </button>
                     </div>
 
-                    <div className="bg-red-700 border border-red-400/50 rounded-lg p-2.5 sm:p-3 space-y-2 text-left shadow-inner">
-                      <div className="grid grid-cols-2 gap-2 border-b border-red-500/80 pb-2">
+                    <div
+                      className="min-h-[74px] flex-1 overflow-hidden rounded-lg border border-red-200/70 bg-red-900/60 bg-cover bg-center shadow-inner sm:min-h-[92px]"
+                      style={
+                        activeSlotAlert.snapshotDataUrl
+                          ? { backgroundImage: `url(${activeSlotAlert.snapshotDataUrl})` }
+                          : undefined
+                      }
+                      aria-label={language === 'BM' ? 'Gambar nombor plat' : 'Plate number snapshot'}
+                    >
+                      {!activeSlotAlert.snapshotDataUrl && (
+                        <div className="flex h-full min-h-[74px] items-center justify-center px-3 sm:min-h-[92px]">
+                          <span className="plate-yellow font-mono text-3xl font-black tracking-wide sm:text-5xl">
+                            {activeSlotAlert.vehicle.plate}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-lg border border-red-400/50 bg-red-700/80 p-2.5 text-left shadow-inner sm:p-3">
+                      <div className="grid grid-cols-2 gap-2">
                         <div>
                           <span className="text-[9px] text-red-100 font-bold uppercase block">{t('plateNumber')}</span>
-                          <span className="plate-yellow text-base sm:text-xl font-mono font-black">
+                          <span className="plate-yellow text-xl font-mono font-black sm:text-2xl">
                             {activeSlotAlert.vehicle.plate}
                           </span>
                         </div>
                         <div>
                           <span className="text-[9px] text-red-100 font-bold uppercase block">{t('outstandingAmount')}</span>
-                          <span className="text-base sm:text-lg font-mono font-black text-white">
+                          <span className="text-lg font-mono font-black text-white sm:text-2xl">
                             {formatMYR(activeSlotAlert.vehicle.outstandingAmount)}
                           </span>
                         </div>
                       </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] sm:text-xs">
-                        <div>
-                          <span className="text-red-100 block">{t('vehicleDetails')}</span>
-                          <strong className="text-white truncate block">
-                            {activeSlotAlert.vehicle.brand} {activeSlotAlert.vehicle.model}
-                          </strong>
-                        </div>
-                        <div>
-                          <span className="text-red-100 block">{language === 'BM' ? 'Kamera' : 'Camera'}</span>
-                          <strong className="text-white truncate block">{activeSlotAlert.cameraName}</strong>
-                        </div>
-                      </div>
                     </div>
 
-                    <div className="flex flex-wrap items-center justify-center gap-1.5 pt-2 border-t border-red-500/80">
+                    <div className="flex items-center justify-center">
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
                           handleMarkAsSeen(slot.id);
                         }}
-                        className="btn-mark-seen px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-red-600 text-[10px] sm:text-xs font-black uppercase tracking-wider flex items-center justify-center gap-1 shadow-md transition-all"
+                        className="btn-mark-seen flex w-full items-center justify-center gap-2 rounded-lg bg-white px-4 py-3 text-xs font-black uppercase tracking-wider text-red-600 shadow-md transition-all hover:bg-slate-100 sm:text-sm"
                       >
-                        <BookmarkCheck className="w-3.5 h-3.5 text-red-600" />
-                        <span>{t('markAction')}</span>
+                        <BookmarkCheck className="h-4 w-4 text-red-600" />
+                        <span>{language === 'BM' ? 'Semak (Tanda Tindakan)' : 'Semak (Mark Action)'}</span>
                       </button>
                     </div>
                   </div>
@@ -5179,12 +5432,26 @@ export default function ScannerPage() {
                         {item.active ? ` · ${language === 'BM' ? 'aktif' : 'active'}` : ''}
                       </div>
                     </div>
-                    <Link
-                      href={item.searchHref}
-                      className="shrink-0 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-[10px] font-black uppercase text-slate-300"
-                    >
-                      {language === 'BM' ? 'Semak' : 'View'}
-                    </Link>
+                    {item.canMarkAction && item.detection ? (
+                      <button
+                        type="button"
+                        onClick={() => handleMarkDetectionAction(item.detection!)}
+                        className="shrink-0 rounded-xl border border-red-500 bg-white px-3 py-2 text-[10px] font-black uppercase text-red-600 shadow-sm"
+                      >
+                        {language === 'BM' ? 'Semak' : 'Review'}
+                      </button>
+                    ) : item.actionStatus === 'REVIEWED' ? (
+                      <span className="shrink-0 rounded-xl border border-emerald-700 bg-emerald-950/70 px-3 py-2 text-[10px] font-black uppercase text-emerald-300">
+                        {language === 'BM' ? 'Disemak' : 'Reviewed'}
+                      </span>
+                    ) : (
+                      <Link
+                        href={item.searchHref}
+                        className="shrink-0 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-[10px] font-black uppercase text-slate-300"
+                      >
+                        {language === 'BM' ? 'Semak' : 'View'}
+                      </Link>
+                    )}
                   </div>
                 </div>
               ))}
@@ -5353,9 +5620,8 @@ export default function ScannerPage() {
         {seenPlateItems.length > 0 && (
           <div className="hidden sm:grid grid-cols-2 gap-2 lg:grid-cols-4">
             {seenPlateItems.slice(0, 8).map((item) => (
-              <Link
+              <div
                 key={item.id}
-                href={item.searchHref}
                 className={`rounded-lg border px-3 py-2 transition-all hover:border-cyan-700 ${getSeenPlateBorderClass(item.tone)}`}
               >
                 <div className="flex items-center justify-between gap-2">
@@ -5365,10 +5631,32 @@ export default function ScannerPage() {
                   </span>
                 </div>
                 <div className="mt-1 truncate text-[10px] font-semibold text-slate-300">{item.detail}</div>
-                <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
-                  {item.confidence}% · {item.timestamp}
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <div className="truncate font-mono text-[10px] text-slate-500">
+                    {item.confidence}% · {item.timestamp}
+                  </div>
+                  {item.canMarkAction && item.detection ? (
+                    <button
+                      type="button"
+                      onClick={() => handleMarkDetectionAction(item.detection!)}
+                      className="shrink-0 rounded-md border border-red-500 bg-white px-2 py-1 text-[9px] font-black uppercase text-red-600 shadow-sm hover:bg-red-50"
+                    >
+                      {language === 'BM' ? 'Semak' : 'Review'}
+                    </button>
+                  ) : item.actionStatus === 'REVIEWED' ? (
+                    <span className="shrink-0 rounded-md border border-emerald-700 bg-emerald-950/70 px-2 py-1 text-[9px] font-black uppercase text-emerald-300">
+                      {language === 'BM' ? 'Disemak' : 'Reviewed'}
+                    </span>
+                  ) : (
+                    <Link
+                      href={item.searchHref}
+                      className="shrink-0 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-[9px] font-black uppercase text-slate-300 hover:border-cyan-800 hover:text-cyan-200"
+                    >
+                      {language === 'BM' ? 'Semak' : 'View'}
+                    </Link>
+                  )}
                 </div>
-              </Link>
+              </div>
             ))}
           </div>
         )}
@@ -5431,6 +5719,7 @@ export default function ScannerPage() {
                 <th className="py-2 px-3">Status</th>
                 <th className="py-2 px-3">Confidence</th>
                 <th className="py-2 px-3">{language === 'BM' ? 'Kamera' : 'Camera'}</th>
+                <th className="py-2 px-3">{language === 'BM' ? 'Tindakan' : 'Action'}</th>
                 <th className="py-2 px-3 text-right">{language === 'BM' ? 'Masa' : 'Time'}</th>
               </tr>
             </thead>
@@ -5463,11 +5752,37 @@ export default function ScannerPage() {
                       </td>
                       <td className="py-2 px-3 text-slate-300 text-[11px]">{det.confidence}%</td>
                       <td className="py-2 px-3 text-slate-300 text-[11px]">{det.cameraName}</td>
+                      <td className="py-2 px-3">
+                        {isUnreviewedAlertDetection(det) ? (
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleMarkDetectionAction(det);
+                            }}
+                            className="rounded-md border border-red-500 bg-white px-2 py-1 text-[9px] font-black uppercase text-red-600 shadow-sm hover:bg-red-50"
+                          >
+                            {language === 'BM' ? 'Semak' : 'Review'}
+                          </button>
+                        ) : det.actionStatus === 'REVIEWED' ? (
+                          <span className="rounded-md border border-emerald-700 bg-emerald-950/70 px-2 py-1 text-[9px] font-black uppercase text-emerald-300">
+                            {language === 'BM' ? 'Disemak' : 'Reviewed'}
+                          </span>
+                        ) : (
+                          <Link
+                            href={`/search?plate=${encodeURIComponent(det.plate)}`}
+                            onClick={(event) => event.stopPropagation()}
+                            className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-[9px] font-black uppercase text-slate-300 hover:border-cyan-800 hover:text-cyan-200"
+                          >
+                            {language === 'BM' ? 'Semak' : 'View'}
+                          </Link>
+                        )}
+                      </td>
                       <td className="py-2 px-3 text-right text-slate-500 text-[10px] sm:text-[11px]">{det.timestamp}</td>
                     </tr>
                     {expandedDetectionId === det.id && (
                       <tr className="bg-slate-950/70">
-                        <td colSpan={5} className="px-3 py-3">
+                        <td colSpan={6} className="px-3 py-3">
                           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] text-slate-400">
                             <div className="flex items-center gap-1.5 md:col-span-2">
                               <MapPin className="h-3.5 w-3.5 text-cyan-400" />
@@ -5483,7 +5798,7 @@ export default function ScannerPage() {
                 ))
               ) : (
                 <tr>
-                  <td colSpan={5} className="py-8 text-center text-slate-500 font-sans">
+                  <td colSpan={6} className="py-8 text-center text-slate-500 font-sans">
                     No scans in this session yet. Start scanning to populate dashboard and audit history.
                   </td>
                 </tr>

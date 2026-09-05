@@ -17,15 +17,16 @@ type FakeCanvas = HTMLCanvasElement & {
   __data: Uint8ClampedArray;
 };
 
-type TestGlobal = typeof globalThis & {
+type MutableTestGlobal = typeof globalThis & {
   window?: unknown;
   document?: unknown;
 };
 
 afterEach(() => {
   vi.restoreAllMocks();
-  delete (globalThis as any).window;
-  delete (globalThis as any).document;
+  const testGlobal = globalThis as MutableTestGlobal;
+  delete testGlobal.window;
+  delete testGlobal.document;
 });
 
 describe('PlateQualityService', () => {
@@ -172,7 +173,7 @@ describe('PlateQualityService', () => {
   });
 
   it('falls back clearly when the quality ONNX model is missing', async () => {
-    (globalThis as any).window = {};
+    (globalThis as MutableTestGlobal).window = {};
     const service = new PlateQualityService({
       fetchFn: vi.fn(async () => ({ ok: false, status: 404 } as Response)),
     });
@@ -184,7 +185,7 @@ describe('PlateQualityService', () => {
   });
 
   it('keeps legacy OCR admission for marginal heuristic crops when the quality model is missing', async () => {
-    (globalThis as any).window = {};
+    (globalThis as MutableTestGlobal).window = {};
     const service = new PlateQualityService({
       fetchFn: vi.fn(async () => ({ ok: false, status: 404 } as Response)),
     });
@@ -214,7 +215,7 @@ describe('PlateQualityService', () => {
   });
 
   it('falls back from WebGPU to WASM and disposes warmup tensors', async () => {
-    (globalThis as any).window = {};
+    (globalThis as MutableTestGlobal).window = {};
     let tensorDisposed = 0;
     let outputDisposed = 0;
     const createCalls: string[][] = [];
@@ -245,7 +246,8 @@ describe('PlateQualityService', () => {
         }),
       },
     };
-    const fetchFn = vi.fn(async (url: string) => {
+    const fetchFn = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = input.toString();
       if (url.endsWith('.json')) {
         return {
           ok: true,
@@ -256,7 +258,7 @@ describe('PlateQualityService', () => {
         ok: true,
         arrayBuffer: async () => new ArrayBuffer(8),
       } as Response;
-    }) as any;
+    }) as unknown as typeof fetch;
     const service = new PlateQualityService({
       fetchFn,
       getOrtFn: async () => fakeOrt as never,
